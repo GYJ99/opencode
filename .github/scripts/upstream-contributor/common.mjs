@@ -19,6 +19,19 @@ const headers = {
   "User-Agent": "GYJ99-opencode-contributor",
 }
 
+const delay = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds))
+
+function retryDelay(response, attempt) {
+  const retryAfter = Number.parseInt(response.headers.get("retry-after") || "", 10)
+  if (Number.isFinite(retryAfter) && retryAfter >= 0) return Math.min((retryAfter + 1) * 1000, 5 * 60_000)
+
+  const reset = Number.parseInt(response.headers.get("x-ratelimit-reset") || "", 10)
+  const untilReset = reset * 1000 - Date.now() + 1000
+  if (Number.isFinite(untilReset) && untilReset > 0) return Math.min(untilReset, 5 * 60_000)
+
+  return [10_000, 30_000, 60_000][attempt - 1] || 60_000
+}
+
 export function validate() {
   if (!token) fail("Missing CONTRIBUTOR_GITHUB_TOKEN")
   if (!["observe", "claim", "autopilot"].includes(mode)) fail(`Unsupported CONTRIBUTION_MODE: ${mode}`)
@@ -26,17 +39,31 @@ export function validate() {
 }
 
 export async function api(path, options = {}) {
-  const response = await fetch(`${apiRoot}${path}`, {
-    ...options,
-    headers: { ...headers, ...(options.headers || {}) },
-  })
-  const text = await response.text()
-  const data = text ? safeJson(text) : null
-  if (!response.ok) {
+  const method = (options.method || "GET").toUpperCase()
+  const attempts = method === "GET" ? 4 : 1
+
+  for (let attempt = 1; attempt <= attempts; attempt += 1) {
+    const response = await fetch(`${apiRoot}${path}`, {
+      ...options,
+      headers: { ...headers, ...(options.headers || {}) },
+    })
+    const text = await response.text()
+    const data = text ? safeJson(text) : null
+    if (response.ok) return data
+
+    const retryable = [403, 429, 500, 502, 503, 504].includes(response.status)
+    if (retryable && attempt < attempts) {
+      const wait = retryDelay(response, attempt)
+      console.warn(`GitHub API ${response.status}; retrying GET ${path} in ${Math.ceil(wait / 1000)} seconds`)
+      await delay(wait)
+      continue
+    }
+
     const message = data?.message || text || response.statusText
     throw new Error(`GitHub API ${response.status}: ${message}`)
   }
-  return data
+
+  throw new Error(`GitHub API request failed after ${attempts} attempts: ${path}`)
 }
 
 function safeJson(text) {
