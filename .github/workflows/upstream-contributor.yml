@@ -1,0 +1,112 @@
+name: OpenCode upstream contributor
+
+on:
+  schedule:
+    - cron: "17 * * * *"
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: Contribution mode
+        required: true
+        default: observe
+        type: choice
+        options:
+          - observe
+          - claim
+          - autopilot
+      issue:
+        description: Optional upstream issue number
+        required: false
+        type: string
+
+concurrency:
+  group: opencode-upstream-contributor
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  UPSTREAM_REPO: anomalyco/opencode
+  BASE_BRANCH: dev
+  CONTRIBUTOR_LOGIN: GYJ99
+  CONTRIBUTOR_EMAIL: 112795205+GYJ99@users.noreply.github.com
+  CONTRIBUTION_MODE: ${{ inputs.mode || vars.CONTRIBUTION_MODE || 'observe' }}
+  TARGET_ISSUE: ${{ inputs.issue || '' }}
+
+jobs:
+  scan:
+    if: github.event_name == 'workflow_dispatch' || vars.CONTRIBUTOR_BOT_ENABLED == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      action: ${{ steps.scan.outputs.action }}
+      issue: ${{ steps.scan.outputs.issue }}
+    steps:
+      - name: Checkout fork
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+
+      - name: Scan upstream issues
+        id: scan
+        env:
+          CONTRIBUTOR_PHASE: scan
+          CONTRIBUTOR_GITHUB_TOKEN: ${{ secrets.CONTRIBUTOR_GITHUB_TOKEN }}
+        run: node .github/scripts/upstream-contributor/index.mjs
+
+  implement:
+    needs: scan
+    if: needs.scan.outputs.action == 'implement'
+    runs-on: ubuntu-latest
+    timeout-minutes: 55
+    steps:
+      - name: Checkout fork
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          ref: dev
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Preserve contributor runner
+        shell: bash
+        run: cp -R .github/scripts/upstream-contributor "$RUNNER_TEMP/upstream-contributor"
+
+      - name: Prepare branch from current upstream dev
+        shell: bash
+        env:
+          ISSUE_NUMBER: ${{ needs.scan.outputs.issue }}
+        run: |
+          set -euo pipefail
+          git remote add upstream https://github.com/anomalyco/opencode.git 2>/dev/null || \
+            git remote set-url upstream https://github.com/anomalyco/opencode.git
+          git fetch --no-tags upstream dev
+          branch="contrib/issue-${ISSUE_NUMBER}"
+          if git ls-remote --exit-code --heads origin "$branch" >/dev/null 2>&1; then
+            echo "::error::Fork branch $branch already exists; refusing to overwrite it"
+            exit 1
+          fi
+          git checkout -B "$branch" upstream/dev
+
+      - name: Setup Bun and dependencies
+        uses: ./.github/actions/setup-bun
+
+      - name: Install OpenCode
+        shell: bash
+        run: curl -fsSL https://opencode.ai/install | bash
+
+      - name: Add OpenCode to PATH
+        shell: bash
+        run: echo "$HOME/.opencode/bin" >> "$GITHUB_PATH"
+
+      - name: Implement, verify, and submit
+        env:
+          CONTRIBUTOR_PHASE: implement
+          CONTRIBUTION_MODE: autopilot
+          TARGET_ISSUE: ${{ needs.scan.outputs.issue }}
+          CONTRIBUTOR_GITHUB_TOKEN: ${{ secrets.CONTRIBUTOR_GITHUB_TOKEN }}
+          OPENCODE_API_KEY: ${{ secrets.OPENCODE_API_KEY }}
+          OPENCODE_MODEL: ${{ vars.CONTRIBUTOR_MODEL }}
+          CONTRIBUTOR_PR_DRAFT: ${{ vars.CONTRIBUTOR_PR_DRAFT || 'true' }}
+          MAX_CHANGED_FILES: ${{ vars.CONTRIBUTOR_MAX_CHANGED_FILES || '12' }}
+          MAX_DIFF_LINES: ${{ vars.CONTRIBUTOR_MAX_DIFF_LINES || '800' }}
+          MAX_CHANGED_BYTES: ${{ vars.CONTRIBUTOR_MAX_CHANGED_BYTES || '2000000' }}
+        run: node "$RUNNER_TEMP/upstream-contributor/index.mjs"
