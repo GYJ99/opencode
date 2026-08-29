@@ -33,10 +33,12 @@ env:
   CONTRIBUTOR_EMAIL: 112795205+GYJ99@users.noreply.github.com
   CONTRIBUTION_MODE: ${{ inputs.mode || vars.CONTRIBUTION_MODE || 'observe' }}
   TARGET_ISSUE: ${{ inputs.issue || '' }}
+  CLAIM_TTL_HOURS: ${{ vars.CONTRIBUTOR_CLAIM_TTL_HOURS || '168' }}
+  CONTRIBUTOR_ALLOW_UI: ${{ vars.CONTRIBUTOR_ALLOW_UI || 'false' }}
 
 jobs:
   scan:
-    if: github.event_name == 'workflow_dispatch' || vars.CONTRIBUTOR_BOT_ENABLED == 'true'
+    if: github.repository == 'GYJ99/opencode' && (github.event_name == 'workflow_dispatch' || vars.CONTRIBUTOR_BOT_ENABLED == 'true')
     runs-on: ubuntu-latest
     timeout-minutes: 10
     outputs:
@@ -80,10 +82,6 @@ jobs:
             git remote set-url upstream https://github.com/anomalyco/opencode.git
           git fetch --no-tags upstream dev
           branch="contrib/issue-${ISSUE_NUMBER}"
-          if git ls-remote --exit-code --heads origin "$branch" >/dev/null 2>&1; then
-            echo "::error::Fork branch $branch already exists; refusing to overwrite it"
-            exit 1
-          fi
           git checkout -B "$branch" upstream/dev
 
       - name: Setup Bun and dependencies
@@ -91,7 +89,7 @@ jobs:
 
       - name: Install OpenCode
         shell: bash
-        run: curl -fsSL https://opencode.ai/install | bash
+        run: curl --proto '=https' --tlsv1.2 -fsSL https://opencode.ai/install | bash
 
       - name: Add OpenCode to PATH
         shell: bash
