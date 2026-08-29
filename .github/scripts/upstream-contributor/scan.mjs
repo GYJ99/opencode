@@ -18,6 +18,9 @@ import {
   upstream,
 } from "./common.mjs"
 
+const claimTtl = Math.max(24, Number.parseInt(process.env.CLAIM_TTL_HOURS || "168", 10) || 168)
+const allowUi = (process.env.CONTRIBUTOR_ALLOW_UI || "false").toLowerCase() === "true"
+
 function blocked(item) {
   const names = labels(item)
   const blockedLabels = [
@@ -37,9 +40,20 @@ function blocked(item) {
   ]
   if (names.some((name) => blockedLabels.some((part) => name.includes(part)))) return true
 
+  if (!allowUi) {
+    const visualLabels = ["ui", "ux", "frontend", "desktop", "tui", "opentui", "design"]
+    if (names.some((name) => visualLabels.some((part) => name === part || name.includes(part)))) return true
+  }
+
   const text = `${item.title || ""}\n${item.body || ""}`.toLowerCase()
   const serviceOnly = /\b(billing|payment|subscription|refund|invoice|quota accounting|usage accounting|account charge|credit balance|zen gateway|server-side gateway|provider outage|free usage exceeded|dependency bump|github action|ci workflow)\b/i
   if (serviceOnly.test(text)) return true
+
+  if (!allowUi) {
+    const visualOnly = /\b(desktop app|web ui|frontend|opentui|tui rendering|theme|dialog|modal|button|layout|sidebar|scrollbar|visual regression)\b/i
+    if (visualOnly.test(text)) return true
+  }
+
   if ((item.body || "").trim().length < 120) return true
   if ((item.body || "").length > 12_000) return true
   if ((item.comments || 0) > 20) return true
@@ -73,14 +87,20 @@ async function hasOpenLinkedPull(number) {
   })
 }
 
-async function claimedByOther(number) {
+async function claimState(number) {
   const list = await getComments(number)
+  const own = list
+    .filter((entry) => entry.user?.login?.toLowerCase() === login.toLowerCase() && (entry.body || "").includes(marker))
+    .sort((a, b) => new Date(b.created_at) - new Date(a.created_at))[0]
+
   const pattern = /\b(i(?:'d| will| can| would like to)?\s+(?:work on|take|handle|implement|fix)\s+(?:this|it)|working on this)\b/i
-  return list.some((entry) => {
+  const other = list.some((entry) => {
     if (entry.user?.login?.toLowerCase() === login.toLowerCase()) return false
     if (hoursSince(entry.created_at) > 24 * 30) return false
     return pattern.test(entry.body || "")
   })
+
+  return { own, other }
 }
 
 async function openPulls() {
@@ -95,11 +115,8 @@ async function pendingClaim() {
   const items = await search(`repo:${upstream} is:issue is:open commenter:${login}`, 20)
   for (const item of items) {
     if (item.assignees?.length) continue
-    const list = await getComments(item.number)
-    const own = list
-      .filter((entry) => entry.user?.login?.toLowerCase() === login.toLowerCase() && (entry.body || "").includes(marker))
-      .sort((a, b) => new Date(b.created_at) - new Date(a.created_at))[0]
-    if (own) return { item, own }
+    const { own } = await claimState(item.number)
+    if (own && hoursSince(own.created_at) <= claimTtl) return { item, own }
   }
   return null
 }
@@ -123,7 +140,8 @@ async function candidate() {
 
   for (const item of ranked.slice(0, 8)) {
     if (await hasOpenLinkedPull(item.number)) continue
-    if (await claimedByOther(item.number)) continue
+    const claim = await claimState(item.number)
+    if (claim.own || claim.other) continue
     return item
   }
   return null
@@ -176,7 +194,7 @@ export async function scan() {
 
   const pending = await pendingClaim()
   if (pending) {
-    summary(`### Waiting for assignment\n\n- Issue: #${pending.item.number} — ${pending.item.title}\n- Claim age: ${hoursSince(pending.own.created_at).toFixed(1)} hours\n- No additional issue will be claimed.`)
+    summary(`### Waiting for assignment\n\n- Issue: #${pending.item.number} — ${pending.item.title}\n- Claim age: ${hoursSince(pending.own.created_at).toFixed(1)} hours\n- Claim timeout: ${claimTtl} hours\n- No additional issue will be claimed.`)
     return
   }
 
@@ -185,8 +203,11 @@ export async function scan() {
     item = await getIssue(requested)
     if (item.pull_request || item.state !== "open") fail(`Issue #${requested} is not an open issue`)
     if (item.assignees?.length && !assignedTo(item, login)) fail(`Issue #${requested} is assigned to another contributor`)
+    if (blocked(item)) fail(`Issue #${requested} does not pass the current policy filters`)
     if (await hasOpenLinkedPull(item.number)) fail(`Issue #${requested} already has an open linked pull request`)
-    if (await claimedByOther(item.number)) fail(`Issue #${requested} appears to be claimed by another contributor`)
+    const claim = await claimState(item.number)
+    if (claim.other) fail(`Issue #${requested} appears to be claimed by another contributor`)
+    if (claim.own) fail(`Assignment has already been requested for issue #${requested}`)
   } else {
     item = await candidate()
   }

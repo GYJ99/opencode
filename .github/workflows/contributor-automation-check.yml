@@ -1,0 +1,59 @@
+name: contributor-automation-check
+
+on:
+  pull_request:
+    paths:
+      - .github/scripts/upstream-contributor/**
+      - .github/workflows/upstream-contributor.yml
+      - .github/workflows/contributor-automation-check.yml
+      - CONTRIBUTOR_AUTOMATION.md
+  push:
+    branches:
+      - automation/upstream-contributor-hardening
+    paths:
+      - .github/scripts/upstream-contributor/**
+      - .github/workflows/upstream-contributor.yml
+      - .github/workflows/contributor-automation-check.yml
+      - CONTRIBUTOR_AUTOMATION.md
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+
+      - name: Check JavaScript syntax
+        shell: bash
+        run: |
+          set -euo pipefail
+          for file in .github/scripts/upstream-contributor/*.mjs; do
+            node --check "$file"
+          done
+
+      - name: Check required pull-request template sections
+        shell: bash
+        run: |
+          set -euo pipefail
+          file=.github/scripts/upstream-contributor/implement.mjs
+          grep -Fq '### Issue for this PR' "$file"
+          grep -Fq '### Type of change' "$file"
+          grep -Fq '### What does this PR do?' "$file"
+          grep -Fq '### How did you verify your code works?' "$file"
+          grep -Fq '### Screenshots / recordings' "$file"
+          grep -Fq '### Checklist' "$file"
+
+      - name: Check safety invariants
+        shell: bash
+        run: |
+          set -euo pipefail
+          grep -Fq 'delete agentEnv.CONTRIBUTOR_GITHUB_TOKEN' .github/scripts/upstream-contributor/implement.mjs
+          grep -Fq 'bash: "deny"' .github/scripts/upstream-contributor/implement.mjs
+          grep -Fq 'CONTRIBUTOR_ALLOW_UI' .github/scripts/upstream-contributor/implement.mjs
+          grep -Fq 'CONTRIBUTOR_BOT_ENABLED' .github/workflows/upstream-contributor.yml
+          grep -Fq "runs-on: ubuntu-latest" .github/workflows/upstream-contributor.yml
