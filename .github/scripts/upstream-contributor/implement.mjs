@@ -9,11 +9,11 @@ import {
   fail,
   getComments,
   getIssue,
+  getTimeline,
   login,
   mode,
   requested,
   run,
-  search,
   summary,
   token,
   upstream,
@@ -59,13 +59,35 @@ function stagedFileBytes(files) {
   return total
 }
 
-function push(branch) {
+function authenticatedPush(args, display) {
   const auth = Buffer.from(`x-access-token:${token}`).toString("base64")
-  console.log(`$ git push origin HEAD:refs/heads/${branch}`)
-  execFileSync(
-    "git",
-    ["-c", `http.extraheader=AUTHORIZATION: basic ${auth}`, "push", "origin", `HEAD:refs/heads/${branch}`],
-    { cwd: process.cwd(), env: process.env, stdio: "inherit", timeout: 5 * 60_000 },
+  console.log(`$ git push origin ${display}`)
+  execFileSync("git", ["-c", `http.extraheader=AUTHORIZATION: basic ${auth}`, "push", "origin", ...args], {
+    cwd: process.cwd(),
+    env: process.env,
+    stdio: "inherit",
+    timeout: 5 * 60_000,
+  })
+}
+
+function push(branch) {
+  authenticatedPush([`HEAD:refs/heads/${branch}`], `HEAD:refs/heads/${branch}`)
+}
+
+function removeRemote(branch) {
+  authenticatedPush([`:refs/heads/${branch}`], `:refs/heads/${branch}`)
+}
+
+async function pullsForBranch(branch) {
+  const head = encodeURIComponent(`${login}:${branch}`)
+  return api(`/repos/${upstream}/pulls?state=all&head=${head}&base=${encodeURIComponent(base)}&per_page=10`)
+}
+
+function isVisualPath(file) {
+  return (
+    file.startsWith("packages/app/") ||
+    file.startsWith("packages/desktop/") ||
+    file.startsWith("packages/opencode/src/cli/cmd/tui/")
   )
 }
 
@@ -81,15 +103,28 @@ export async function implement() {
   if (item.state !== "open" || item.pull_request) fail(`Issue #${requested} is not an open issue`)
   if (!assignedTo(item, login)) fail(`Issue #${requested} is not assigned to ${login}`)
 
-  const existing = await search(`repo:${upstream} is:pr is:open author:${login} \"#${requested}\"`, 10)
-  if (existing.length) {
-    summary(`### Already submitted\n\nUpstream PR #${existing[0].number} already references issue #${requested}.`)
+  const linked = (await getTimeline(requested)).find((event) => {
+    const source = event.source?.issue
+    return Boolean(source?.pull_request && source.state === "open")
+  })
+  if (linked) {
+    summary(`### Paused\n\nIssue #${requested} already has an open linked pull request. No duplicate PR was created.`)
     return
   }
 
   const branch = `contrib/issue-${requested}`
+  const prior = await pullsForBranch(branch)
+  if (prior.length) {
+    const pull = prior[0]
+    summary(`### Previously submitted\n\nUpstream PR #${pull.number} already used branch \`${branch}\` and is currently \`${pull.state}\`. The workflow will not submit it again.`)
+    return
+  }
+
   const remoteBranch = run("git", ["ls-remote", "--heads", "origin", branch], { capture: true }) || ""
-  if (remoteBranch.trim()) fail(`Fork branch ${branch} already exists; refusing to overwrite it`)
+  if (remoteBranch.trim()) {
+    summary(`### Recovering stale branch\n\nDeleting \`${branch}\` because it has no corresponding upstream pull request.`)
+    removeRemote(branch)
+  }
 
   const current = (run("git", ["branch", "--show-current"], { capture: true }) || "").trim()
   if (current !== branch) fail(`Expected prepared branch ${branch}, found ${current || "detached HEAD"}`)
@@ -186,6 +221,12 @@ Implement the fix now.`
     fail("The generated patch added or modified a blocked binary path")
   }
 
+  const visual = files.some(isVisualPath)
+  const allowVisual = (process.env.CONTRIBUTOR_ALLOW_UI || "false").toLowerCase() === "true"
+  if (visual && !allowVisual) {
+    fail("The generated patch touches visual UI code; set CONTRIBUTOR_ALLOW_UI=true only for supervised runs")
+  }
+
   const maxFiles = Number.parseInt(process.env.MAX_CHANGED_FILES || "12", 10)
   const maxLines = Number.parseInt(process.env.MAX_DIFF_LINES || "800", 10)
   const maxBytes = Number.parseInt(process.env.MAX_CHANGED_BYTES || "2000000", 10)
@@ -197,9 +238,13 @@ Implement the fix now.`
   const bytes = stagedFileBytes(files)
   if (bytes > maxBytes) fail(`Changed working-tree files total ${bytes} bytes; limit is ${maxBytes}`)
 
+  const verification = []
   run("git", ["diff", "--cached", "--check"])
+  verification.push("`git diff --cached --check`")
   run("bun", ["run", "lint"], { timeout: 12 * 60_000 })
+  verification.push("`bun run lint`")
   run("bun", ["run", "typecheck"], { timeout: 18 * 60_000 })
+  verification.push("`bun run typecheck`")
 
   const roots = new Set()
   for (const file of files) {
@@ -214,7 +259,10 @@ Implement the fix now.`
   }
   for (const directory of [...roots].slice(0, 3)) {
     const pkg = JSON.parse(readFileSync(path.join(directory, "package.json"), "utf8"))
-    if (pkg.scripts?.test) run("bun", ["run", "--cwd", directory, "test"], { timeout: 15 * 60_000 })
+    if (pkg.scripts?.test) {
+      run("bun", ["run", "--cwd", directory, "test"], { timeout: 15 * 60_000 })
+      verification.push(`\`bun run --cwd ${directory} test\``)
+    }
   }
 
   const unstaged = [
@@ -227,20 +275,40 @@ Implement the fix now.`
   run("git", ["commit", "-m", title])
   push(branch)
 
-  const draft = (process.env.CONTRIBUTOR_PR_DRAFT || "true").toLowerCase() !== "false"
+  const requestedDraft = (process.env.CONTRIBUTOR_PR_DRAFT || "true").toLowerCase() !== "false"
+  const draft = visual || requestedDraft
+  const listed = files.slice(0, 8).map((file) => `\`${file}\``).join(", ")
   const body = [
-    "## Summary",
-    "",
-    `- Fixes the behavior described in #${requested}.`,
-    `- Keeps the change scoped to ${files.length} file${files.length === 1 ? "" : "s"}: ${files.slice(0, 6).map((file) => `\`${file}\``).join(", ")}${files.length > 6 ? ", …" : ""}.`,
-    "",
-    "## Verification",
-    "",
-    "- `git diff --check`",
-    "- `bun run lint`",
-    "- `bun run typecheck`",
+    "### Issue for this PR",
     "",
     `Closes #${requested}`,
+    "",
+    "### Type of change",
+    "",
+    "- [x] Bug fix",
+    "- [ ] New feature",
+    "- [ ] Refactor / code improvement",
+    "- [ ] Documentation",
+    "",
+    "### What does this PR do?",
+    "",
+    `Addresses the reported \`${cleanTitle(item.title)}\` behavior against the current \`${base}\` branch.`,
+    `The patch is limited to ${files.length} file${files.length === 1 ? "" : "s"}: ${listed}${files.length > 8 ? ", …" : ""}.`,
+    "",
+    "### How did you verify your code works?",
+    "",
+    ...verification.map((command) => `- ${command}`),
+    "",
+    "### Screenshots / recordings",
+    "",
+    visual
+      ? "This is a draft PR. Screenshots or a recording must be added before it is marked ready for review."
+      : "Not applicable; no visual UI files were changed.",
+    "",
+    "### Checklist",
+    "",
+    "- [x] I have tested my changes locally",
+    "- [x] I have not included unrelated changes in this PR",
   ].join("\n")
 
   const pull = await api(`/repos/${upstream}/pulls`, {
